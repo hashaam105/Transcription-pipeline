@@ -14,9 +14,10 @@ Audio upload → Validate → Normalize (16 kHz mono WAV) → Chunk on silence �
 - **Speech-to-text with [faster-whisper](https://github.com/SYSTRAN/faster-whisper).** Open source and offline. It uses the GPU (float16) when one is available and falls back to CPU (int8). VAD skips silence, and the language is detected automatically.
 - **Pluggable engines.** Engines implement the `Transcriber` interface. A deterministic `MockTranscriber` lets the pipeline and tests run without a model.
 - **Timestamps for each segment** (seconds plus `HH:MM:SS.mmm`), optional word-level timestamps, and a confidence score for each segment.
-- **Long audio.** The audio is split into ~60 s chunks, cut at the quietest point near each boundary so words aren't split. Each chunk's timestamps are shifted to absolute time, and the merged segments are sorted, have overlaps removed and are re-indexed.
+- **Long audio.** The audio is split into ~60 s chunks, cut at the quietest point near each boundary so words aren't split. Each chunk's timestamps are shifted to absolute time. The merged segments are sorted and re-indexed, and where two segments overlap, words already transcribed are removed (by word timestamps when available, otherwise by matching the repeated words).
 - **Retries.** Transient failures are retried with exponential backoff. Input errors (corrupt or unsupported files) fail fast and are never retried.
-- **Async API.** Upload returns `202` with a `job_id` straight away. You can then check status and progress, fetch the result, or retry the job. A synchronous endpoint is available for short clips.
+- **Async API.** Upload returns `202` with a `job_id` straight away. You can then check status and progress, fetch the result, or retry the job. A synchronous endpoint is available for short clips; it runs the model in a worker thread so the event loop is never blocked.
+- **Jobs survive restarts.** Jobs and results are stored in SQLite. On startup, jobs that were queued or mid-processing are re-queued automatically.
 - **Downstream-ready output.** You get the cleaned text (fillers removed) alongside the raw text, plus word count, average confidence, and a list of low-confidence segments to flag for human review.
 
 ## Project layout
@@ -29,7 +30,7 @@ transcription_service/
   pipeline.py      # orchestration, retry, chunk merge
   postprocess.py   # text clean-up
   formatters.py    # SRT / VTT / TXT output
-  api.py           # FastAPI service + job store + worker pool
+  api.py           # FastAPI service + SQLite job store + worker pool
   cli.py           # command-line entry point
 tests/             # pytest suite (runs on the mock engine)
 ```
@@ -112,10 +113,12 @@ Example result (truncated):
 | `MAX_FILE_SIZE_MB` | `25` | Upload limit |
 | `MAX_DURATION_SEC` | `3600` | Audio length limit |
 | `CHUNK_LENGTH_SEC` | `60` | Target chunk size for long audio |
-| `MAX_RETRIES` | `3` | Attempts per chunk for transient errors |
-| `RETRY_BASE_DELAY_SEC` | `2` | Backoff base (2s, 6s, 18s) |
+| `MAX_RETRIES` | `3` | Total attempts per chunk for transient errors |
+| `RETRY_BASE_DELAY_SEC` | `2` | Backoff base: waits 2s, then 6s between the 3 attempts |
 | `WORKER_THREADS` | `2` | Parallel transcription jobs |
 | `MAX_QUEUED_JOBS` | `50` | Above this, uploads get `429` + `Retry-After` |
+| `JOBS_DB_PATH` | `storage/jobs.db` | SQLite file for jobs and results |
+| `LOW_CONFIDENCE_THRESHOLD` | `0.6` | Segments below this are listed in `low_confidence_segments` |
 
 ### Docker
 
@@ -146,11 +149,12 @@ including concurrent uploads.
 | Chunks cut at the quietest point | Keeps words whole at boundaries and limits memory use for long files. |
 | Validation errors separate from transient errors | Corrupt input fails fast with a clear message. Only transient errors are retried. |
 | Async jobs + bounded worker pool + 429 backpressure | Uploads stay fast, bursts are absorbed, and the server is never overloaded. |
+| Jobs persisted in SQLite, recovered on startup | A restart or crash doesn't lose jobs; unfinished work is picked up again. |
 | Clean text alongside raw text | Downstream NLP gets tidy text without losing the original transcript. |
 
 ## Taking it to production
 
-This repo keeps the infrastructure in-process so it is easy to run. To scale it, each piece maps to a managed component:
+This repo keeps the infrastructure in-process (SQLite, a thread pool) so it is easy to run. To scale it, each piece maps to a managed component:
 
 - **Uploads:** presigned S3/GCS URLs with multipart/resumable upload, so files don't pass through the API servers.
 - **Storage:** audio in object storage under `audio/{job_id}`, with lifecycle rules moving it to cold storage or deleting it. Jobs and transcripts (segments as JSONB) go in PostgreSQL, with optional Elasticsearch for full-text search. Everything is encrypted, with access per owner and a retention policy (GDPR).

@@ -53,10 +53,37 @@ def format_ts(seconds: float, sep: str = ".") -> str:
     return f"{h:02d}:{m:02d}:{s:02d}{sep}{ms:03d}"
 
 
+def _norm_token(token: str) -> str:
+    return "".join(c for c in token.lower() if c.isalnum())
+
+
+def _strip_repeated_prefix(prev_text: str, text: str, max_words: int = 8) -> str:
+    """Remove the longest run of words at the start of `text` that repeats the end of `prev_text`."""
+    prev_tokens, tokens = prev_text.split(), text.split()
+    prev_norm, norm = [_norm_token(t) for t in prev_tokens], [_norm_token(t) for t in tokens]
+    for n in range(min(max_words, len(prev_tokens), len(tokens)), 0, -1):
+        if prev_norm[-n:] == norm[:n]:
+            return " ".join(tokens[n:])
+    return text
+
+
+def _dedupe_overlap(seg: Segment, prev: Segment) -> None:
+    """Drop the part of `seg` that was already transcribed in `prev` (they overlap in time)."""
+    if seg.words:
+        seg.words = [w for w in seg.words if (w.start + w.end) / 2 >= prev.end]
+        seg.text = " ".join(w.word for w in seg.words)
+        if seg.words:
+            seg.start = max(seg.start, seg.words[0].start)
+    else:
+        seg.text = _strip_repeated_prefix(prev.text, seg.text)
+
+
 def normalize_segments(segments: list[Segment]) -> list[Segment]:
-    """Sort, remove overlaps and empty segments, re-index, add readable timestamps."""
+    """Sort, de-duplicate overlapping speech, drop empty segments, re-index, add readable timestamps."""
     cleaned, prev_end = [], 0.0
     for seg in sorted(segments, key=lambda s: s.start):
+        if cleaned and seg.start < prev_end:
+            _dedupe_overlap(seg, cleaned[-1])
         seg.start = round(max(seg.start, prev_end), 2)
         seg.end = round(seg.end, 2)
         if seg.end <= seg.start or not seg.text.strip():

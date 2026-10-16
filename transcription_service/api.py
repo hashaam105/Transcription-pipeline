@@ -9,17 +9,21 @@ POST /v1/transcriptions/{id}/retry retry a failed job
 DELETE /v1/transcriptions/{id}     delete job and stored audio
 GET  /health
 """
+import json
 import logging
 import shutil
+import sqlite3
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.concurrency import run_in_threadpool
 
 from .audio import AudioValidationError
 from .config import ALLOWED_EXTENSIONS, settings
@@ -32,46 +36,82 @@ log = logging.getLogger(__name__)
 STORAGE_DIR = Path("storage/uploads")  # stand-in for object storage (S3/GCS)
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
-app = FastAPI(title="Transcription Service", version="1.0.0")
-pipeline = TranscriptionPipeline()  # model loaded once at startup
-executor = ThreadPoolExecutor(max_workers=settings.worker_threads)  # stand-in for a job queue + workers
-
-
 class JobStore:
-    """Thread-safe in-memory job store. In production: PostgreSQL / Redis."""
+    """Thread-safe job store persisted in SQLite, so jobs survive a restart.
+    Each job is stored as a JSON document keyed by job_id. In production: PostgreSQL / Redis."""
 
-    def __init__(self):
-        self._jobs: dict[str, dict] = {}
+    def __init__(self, db_path: str):
+        if db_path != ":memory:":
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._lock = threading.Lock()
+        with self._lock, self._conn:
+            self._conn.execute("CREATE TABLE IF NOT EXISTS jobs ("
+                               "job_id TEXT PRIMARY KEY, status TEXT NOT NULL, data TEXT NOT NULL)")
+
+    def _save(self, job: dict) -> None:
+        self._conn.execute("INSERT OR REPLACE INTO jobs (job_id, status, data) VALUES (?, ?, ?)",
+                           (job["job_id"], job["status"], json.dumps(job)))
+
+    def _load(self, job_id: str) -> dict | None:
+        row = self._conn.execute("SELECT data FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def create(self, job: dict) -> None:
-        with self._lock:
-            self._jobs[job["job_id"]] = job
+        with self._lock, self._conn:
+            self._save(job)
 
     def update(self, job_id: str, **fields) -> None:
-        with self._lock:
-            if job_id in self._jobs:
-                self._jobs[job_id].update(fields, updated_at=_now())
+        with self._lock, self._conn:
+            job = self._load(job_id)
+            if job:
+                job.update(fields, updated_at=_now())
+                self._save(job)
 
     def get(self, job_id: str) -> dict | None:
         with self._lock:
-            job = self._jobs.get(job_id)
-            return dict(job) if job else None
+            return self._load(job_id)
 
     def list(self) -> list[dict]:
         with self._lock:
-            return [dict(j) for j in self._jobs.values()]
+            return [json.loads(r[0]) for r in self._conn.execute("SELECT data FROM jobs")]
 
     def delete(self, job_id: str) -> dict | None:
-        with self._lock:
-            return self._jobs.pop(job_id, None)
+        with self._lock, self._conn:
+            job = self._load(job_id)
+            self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            return job
 
     def active_count(self) -> int:
         with self._lock:
-            return sum(j["status"] in ("queued", "processing") for j in self._jobs.values())
+            return self._conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE status IN ('queued', 'processing')").fetchone()[0]
 
 
-jobs = JobStore()
+def _recover_jobs() -> None:
+    """Re-queue jobs that were queued or mid-processing when the server stopped."""
+    for job in jobs.list():
+        if job["status"] not in ("queued", "processing"):
+            continue
+        if Path(job["audio_path"]).exists():
+            log.info("Recovering job %s", job["job_id"])
+            jobs.update(job["job_id"], status="queued", progress=0)
+            executor.submit(_run_job, job["job_id"])
+        else:
+            jobs.update(job["job_id"], status="failed", error="Audio lost during restart", retryable=False)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    _recover_jobs()
+    yield
+    executor.shutdown(wait=False, cancel_futures=True)
+
+
+app = FastAPI(title="Transcription Service", version="1.0.0", lifespan=lifespan)
+pipeline = TranscriptionPipeline()  # model loaded once at startup
+executor = ThreadPoolExecutor(max_workers=settings.worker_threads)  # stand-in for a job queue + workers
+jobs = JobStore(settings.jobs_db_path)
 
 
 def _now() -> str:
@@ -158,7 +198,9 @@ async def transcribe_sync(
     job_id = str(uuid.uuid4())
     audio_path = await _save_upload(file, job_id)
     try:
-        result = pipeline.run(audio_path, language=language, word_timestamps=word_timestamps, job_id=job_id)
+        # pipeline.run is blocking CPU/GPU work: run it in a worker thread so the event loop stays responsive
+        result = await run_in_threadpool(pipeline.run, audio_path, language=language,
+                                         word_timestamps=word_timestamps, job_id=job_id)
         result["file_name"] = file.filename
     except AudioValidationError as e:
         raise HTTPException(400, str(e))

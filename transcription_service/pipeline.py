@@ -18,7 +18,8 @@ ProgressCallback = Callable[[int, int], None]
 
 
 def with_retry(fn: Callable, *, retries: int, base_delay: float, label: str):
-    """Retry transient failures with exponential backoff. Input errors are never retried."""
+    """Retry transient failures with exponential backoff. Input errors are never retried.
+    `retries` is the total number of attempts, so 3 attempts wait base_delay, then base_delay * 3."""
     for attempt in range(1, retries + 1):
         try:
             return fn()
@@ -89,7 +90,8 @@ class TranscriptionPipeline:
                 "language": detected_language,
                 "word_count": word_count(clean),
                 "avg_confidence": round(sum(s.confidence for s in segments) / len(segments), 3) if segments else 0.0,
-                "low_confidence_segments": [s.id for s in segments if s.confidence < 0.6],
+                "low_confidence_segments": [s.id for s in segments
+                                            if s.confidence < settings.low_confidence_threshold],
                 "segments": [_segment_dict(s, word_timestamps) for s in segments],
                 "engine": self.transcriber.name,
             },

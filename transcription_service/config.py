@@ -32,6 +32,10 @@ class Settings:
     # Concurrency for the async API
     worker_threads: int = field(default_factory=lambda: _env_int("WORKER_THREADS", 2))
     max_queued_jobs: int = field(default_factory=lambda: _env_int("MAX_QUEUED_JOBS", 50))
+    jobs_db_path: str = field(default_factory=lambda: os.getenv("JOBS_DB_PATH", "storage/jobs.db"))
+
+    # Segments below this confidence are flagged for human review
+    low_confidence_threshold: float = field(default_factory=lambda: _env_float("LOW_CONFIDENCE_THRESHOLD", 0.6))
 
 
 ALLOWED_EXTENSIONS = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".webm"}

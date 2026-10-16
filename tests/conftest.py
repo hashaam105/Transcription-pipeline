@@ -4,6 +4,7 @@ import os
 os.environ["STT_ENGINE"] = "mock"
 os.environ["RETRY_BASE_DELAY_SEC"] = "0"
 os.environ["CHUNK_LENGTH_SEC"] = "20"
+os.environ["JOBS_DB_PATH"] = ":memory:"
 
 from pathlib import Path  # noqa: E402
 

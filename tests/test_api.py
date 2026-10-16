@@ -1,8 +1,10 @@
 import time
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from transcription_service.api import app
+from transcription_service import api
+from transcription_service.api import JobStore, app
 
 client = TestClient(app)
 
@@ -70,3 +72,31 @@ def test_corrupt_file_fails_without_retry_flag():
 
 def test_result_before_completion_and_missing_job():
     assert client.get("/v1/transcriptions/does-not-exist/result").status_code == 404
+
+
+def test_job_store_survives_restart(tmp_path):
+    db = str(tmp_path / "jobs.db")
+    JobStore(db).create({"job_id": "abc", "status": "completed", "result": {"text": "hi"}})
+    reopened = JobStore(db)  # a new process opening the same database
+    assert reopened.get("abc")["result"] == {"text": "hi"}
+    assert reopened.active_count() == 0
+
+
+def test_unfinished_jobs_are_recovered_on_startup(short_wav, monkeypatch):
+    store = JobStore(":memory:")
+    monkeypatch.setattr(api, "jobs", store)
+    audio = Path(short_wav)
+    store.create({"job_id": "interrupted", "file_name": audio.name, "audio_path": str(audio),
+                  "language": None, "word_timestamps": False, "status": "processing", "progress": 40,
+                  "error": None, "retryable": None, "result": None})
+    store.create({"job_id": "lost", "file_name": "gone.wav", "audio_path": str(audio.parent / "gone.wav"),
+                  "language": None, "word_timestamps": False, "status": "queued", "progress": 0,
+                  "error": None, "retryable": None, "result": None})
+
+    api._recover_jobs()
+
+    deadline = time.time() + 10
+    while store.get("interrupted")["status"] != "completed" and time.time() < deadline:
+        time.sleep(0.1)
+    assert store.get("interrupted")["status"] == "completed"
+    assert store.get("lost")["status"] == "failed" and store.get("lost")["retryable"] is False
